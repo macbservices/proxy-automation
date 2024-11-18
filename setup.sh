@@ -1,185 +1,101 @@
 #!/bin/bash
 
-# Configuração básica
+# Diretórios e arquivos do projeto
 PROJECT_DIR="/opt/proxy-automation"
-CONFIG_FILE="$PROJECT_DIR/proxies.json"
-PROXY_LIST="/root/proxies.txt"
+PROXY_LIST_DIR="$PROJECT_DIR/proxy_lists"
 DOWNLOADED_LISTS="$PROJECT_DIR/downloaded_lists.json"
-GITHUB_BASE_URL="https://raw.githubusercontent.com/macbservices/proxy-lists/main"
+GITHUB_REPO_URL="https://raw.githubusercontent.com/macbservices/proxy-automation/refs/heads/main"
 
-# Funções principais
-
-install_dependencies() {
-    echo "Atualizando pacotes e instalando dependências..."
-    apt update && apt upgrade -y
-    apt install -y python3 python3-pip iptables-persistent curl jq
+# Função para baixar uma lista de proxies específica do GitHub
+download_proxy_list() {
+    local list_url="$GITHUB_REPO_URL/proxy_lists/$1"
+    
+    echo "Baixando a lista de proxies: $1"
+    curl -s -o "$PROXY_LIST_DIR/$1" "$list_url"
 }
 
-create_project_structure() {
-    echo "Criando estrutura do projeto..."
-    mkdir -p "$PROJECT_DIR"
-    touch "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
-    touch "$PROXY_LIST"
-    chmod 600 "$PROXY_LIST"
-    touch "$DOWNLOADED_LISTS"
-    chmod 600 "$DOWNLOADED_LISTS"
-    echo "{}" >"$DOWNLOADED_LISTS"
-}
-
-enable_packet_forwarding() {
-    echo "Ativando redirecionamento de pacotes..."
-    sysctl -w net.ipv4.ip_forward=1
-    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-}
-
-configure_firewall() {
-    echo "Configurando firewall com iptables..."
-    iptables -A INPUT -p tcp --dport 1:65535 -j ACCEPT
-    iptables -A OUTPUT -p tcp --sport 1:65535 -j ACCEPT
-    iptables -A FORWARD -p tcp --dport 1:65535 -j ACCEPT
-    iptables -A FORWARD -p tcp --sport 1:65535 -j ACCEPT
-    iptables-save > /etc/iptables/rules.v4
-}
-
-download_more_proxies() {
-    echo "Verificando necessidade de novos proxies..."
-    local available_proxies=$(grep -cve '^\s*$' "$PROXY_LIST")
-
-    if [ "$available_proxies" -le 2 ]; then
-        echo "Apenas $available_proxies proxies disponíveis. Buscando novas listas no GitHub..."
-
-        for i in {1..10}; do
-            local file_name="proxy_list_$i.txt"
-            local file_url="$GITHUB_BASE_URL/$file_name"
-
-            # Verifica se a lista já foi baixada
-            if jq -e --arg file "$file_name" '.[$file]?' "$DOWNLOADED_LISTS" >/dev/null; then
-                echo "Lista $file_name já foi baixada. Pulando."
-                continue
-            fi
-
-            # Tenta baixar a lista
-            echo "Baixando $file_name..."
-            curl -s -o "$PROJECT_DIR/$file_name" "$file_url"
-            if [ $? -eq 0 ]; then
-                echo "Lista $file_name baixada com sucesso."
-
-                # Adiciona os proxies ao arquivo principal
-                cat "$PROJECT_DIR/$file_name" >>"$PROXY_LIST"
-                rm -f "$PROJECT_DIR/$file_name"
-
-                # Marca a lista como baixada
-                jq --arg file "$file_name" '.[$file] = true' "$DOWNLOADED_LISTS" >"$DOWNLOADED_LISTS.tmp"
-                mv "$DOWNLOADED_LISTS.tmp" "$DOWNLOADED_LISTS"
-                return
-            else
-                echo "Falha ao baixar $file_name. Verifique a URL: $file_url"
-            fi
-        done
-        echo "Nenhuma nova lista foi baixada."
+# Função para verificar se a lista de proxies precisa ser baixada
+is_new_list() {
+    local list_name="$1"
+    if jq -e ".lists[\"$list_name\"]" "$DOWNLOADED_LISTS" > /dev/null; then
+        echo "A lista $list_name já foi baixada."
+        return 1
     else
-        echo "Ainda há $available_proxies proxies disponíveis. Não é necessário baixar mais."
+        return 0
     fi
 }
 
-install_python_script() {
-    echo "Instalando script Python..."
-    cat <<EOF >"$PROJECT_DIR/proxy_manager.py"
-import os
-import subprocess
-import json
-
-CONFIG_FILE = "$CONFIG_FILE"
-PROXY_LIST = "$PROXY_LIST"
-DOWNLOAD_MORE_PROXIES = "$PROJECT_DIR/download_more_proxies.sh"
-
-def load_proxies():
-    if not os.path.exists(PROXY_LIST):
-        print(f"Arquivo de proxies não encontrado: {PROXY_LIST}")
-        return []
-    with open(PROXY_LIST, "r") as file:
-        return [line.strip() for line in file if line.strip()]
-
-def assign_proxy(ip_private):
-    proxies = load_proxies()
-    if not proxies:
-        print("Nenhum proxy disponível. Tentando baixar mais proxies...")
-        subprocess.run([DOWNLOAD_MORE_PROXIES], shell=True)
-        proxies = load_proxies()
-        if not proxies:
-            print("Ainda assim, nenhum proxy disponível. Tente novamente mais tarde.")
-            return
-    
-    proxy = proxies.pop(0)
-    proxy_parts = proxy.split(':')
-    ip, port, user, password = proxy_parts
-
-    print(f"Atribuindo proxy {ip}:{port} para {ip_private}")
-    
-    # Configuração de NAT para o IP privado
-    command_nat = f"iptables -t nat -A POSTROUTING -s {ip_private} -j SNAT --to-source {ip}"
-    subprocess.run(command_nat, shell=True)
-
-    # Configuração de encaminhamento para o IP privado
-    command_forward = f"iptables -A FORWARD -s {ip_private} -j ACCEPT"
-    subprocess.run(command_forward, shell=True)
-    command_forward_back = f"iptables -A FORWARD -d {ip_private} -j ACCEPT"
-    subprocess.run(command_forward_back, shell=True)
-
-    # Atualizar a lista de proxies, removendo o que foi usado
-    with open(PROXY_LIST, "w") as file:
-        file.write("\n".join(proxies))
-    
-    # Salvar configuração no arquivo JSON
-    with open(CONFIG_FILE, 'r+') as file:
-        data = json.load(file) if os.stat(CONFIG_FILE).st_size != 0 else {}
-        data[ip_private] = proxy
-        file.seek(0)
-        json.dump(data, file)
-        file.truncate()
-
-    print(f"Proxy {ip}:{port} atribuído ao IP privado {ip_private}.")
-
-def list_assigned_proxies():
-    if not os.path.exists(CONFIG_FILE) or os.stat(CONFIG_FILE).st_size == 0:
-        print("Nenhuma configuração encontrada.")
-        return
-    with open(CONFIG_FILE, 'r') as file:
-        data = json.load(file)
-        for ip_private, proxy in data.items():
-            print(f"IP Privado: {ip_private} -> Proxy: {proxy}")
-
-if __name__ == "__main__":
-    print("Gerenciador de Proxies")
-    print("1. Atribuir proxy a um IP privado")
-    print("2. Listar atribuições")
-    choice = input("Escolha uma opção: ")
-    
-    if choice == "1":
-        ip_private = input("Digite o IP privado da VPS: ")
-        assign_proxy(ip_private)
-    elif choice == "2":
-        list_assigned_proxies()
-    else:
-        print("Opção inválida.")
-EOF
-
-    chmod +x "$PROJECT_DIR/proxy_manager.py"
+# Função para registrar que uma lista de proxies foi baixada
+mark_list_as_downloaded() {
+    local list_name="$1"
+    jq --arg list_name "$list_name" '.lists[$list_name] = true' "$DOWNLOADED_LISTS" > "$DOWNLOADED_LISTS.tmp" && mv "$DOWNLOADED_LISTS.tmp" "$DOWNLOADED_LISTS"
 }
 
-setup_complete() {
-    echo "Configuração concluída!"
-    echo "Para gerenciar proxies, execute:"
-    echo "  python3 $PROJECT_DIR/proxy_manager.py"
-    echo "Certifique-se de adicionar suas listas no GitHub em $GITHUB_BASE_URL"
+# Função para verificar se o arquivo de proxies está vazio
+is_proxy_list_empty() {
+    local proxy_count=$(wc -l < "$PROXY_LIST_DIR/proxy_list.txt")
+    if [ "$proxy_count" -le 2 ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
-# Execução das funções
-install_dependencies
-create_project_structure
-enable_packet_forwarding
-configure_firewall
-download_more_proxies
-install_python_script
-setup_complete
+# Função de configuração inicial
+setup_initial() {
+    # Criar o diretório do projeto, se não existir
+    if [ ! -d "$PROJECT_DIR" ]; then
+        echo "Criando o diretório do projeto..."
+        mkdir -p "$PROJECT_DIR"
+    fi
+
+    # Criar o diretório de listas de proxies, se não existir
+    if [ ! -d "$PROXY_LIST_DIR" ]; then
+        echo "Criando o diretório de listas de proxies..."
+        mkdir -p "$PROXY_LIST_DIR"
+    fi
+
+    # Criar o arquivo de controle (downloaded_lists.json), se não existir
+    if [ ! -f "$DOWNLOADED_LISTS" ]; then
+        touch "$DOWNLOADED_LISTS"
+        chmod 600 "$DOWNLOADED_LISTS"
+        echo '{"lists": {}}' > "$DOWNLOADED_LISTS"
+    fi
+
+    # Criar o arquivo de proxies se não existir
+    if [ ! -f "$PROXY_LIST_DIR/proxy_list.txt" ]; then
+        touch "$PROXY_LIST_DIR/proxy_list.txt"
+    fi
+}
+
+# Função principal de execução
+main() {
+    setup_initial
+
+    # Verificar se a lista de proxies precisa ser baixada
+    if is_proxy_list_empty; then
+        # Buscar todas as listas de proxies no repositório
+        echo "Proxies estão abaixo de 2, vamos buscar novas listas."
+        
+        # Obter a lista de arquivos no diretório 'proxy_lists'
+        proxy_files=$(curl -s "https://api.github.com/repos/macbservices/proxy-automation/contents/proxy_lists" | jq -r '.[].name')
+
+        for proxy_file in $proxy_files; do
+            if is_new_list "$proxy_file"; then
+                download_proxy_list "$proxy_file"
+                mark_list_as_downloaded "$proxy_file"
+                echo "Lista $proxy_file baixada e registrada."
+            else
+                echo "A lista $proxy_file já foi baixada anteriormente."
+            fi
+        done
+
+    else
+        echo "Há proxies suficientes no arquivo (mais de 2). Nenhuma nova lista será baixada."
+    fi
+
+    echo "Configuração e verificação de proxies concluídas!"
+}
+
+# Executar o processo principal
+main
